@@ -1,0 +1,10 @@
+name: hcom
+version: 0.1.0
+description: "Bridge hcom identities into Hermes gateway sessions and report hcom hermes CLI lifecycle."
+author: Michael Heca
+kind: standalone
+hooks:
+  - on_cli_ready
+  - on_cli_turn_start
+  - on_cli_turn_end
+  - on_cli_shutdown
