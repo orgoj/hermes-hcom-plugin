@@ -318,7 +318,13 @@ class HcomGatewayService:
         self.runner = runner
         self.config = config
         self.child_env = os.environ.copy()
-        for key in ("HCOM_PROCESS_ID", "HCOM_INSTANCE_NAME", "HCOM_TOOL"):
+        for key in (
+            "HCOM_DIR",
+            "HCOM_AGENT_CATALOGS",
+            "HCOM_PROCESS_ID",
+            "HCOM_INSTANCE_NAME",
+            "HCOM_TOOL",
+        ):
             self.child_env.pop(key, None)
         self.child_env.update(config.env)
         self.completed = CompletedEventStore(
@@ -387,6 +393,18 @@ class HcomGatewayService:
         if code:
             raise RuntimeError(f"hcom registration failed for {identity}: {stderr}")
         self._registered.add(identity)
+
+    async def _validate_extra_catalogs(self) -> None:
+        """Fail bridge startup when an explicitly configured extra is invalid."""
+        catalogs = self.config.env.get("HCOM_AGENT_CATALOGS", "").strip()
+        if not catalogs:
+            return
+        code, _, stderr = await self._run("agent", "list")
+        if code:
+            detail = stderr or "hcom agent list exited unsuccessfully"
+            raise RuntimeError(
+                f"HCOM_AGENT_CATALOGS configuration is invalid ({catalogs}): {detail}"
+            )
 
     async def _unregister(self, identity: str) -> None:
         code, _, stderr = await self._run("stop", identity, identity=identity)
@@ -501,6 +519,7 @@ class HcomGatewayService:
                     )
 
     async def start(self) -> None:
+        await self._validate_extra_catalogs()
         for binding in self.config.bridges:
             task = asyncio.create_task(self._run_binding(binding))
             self._tasks.add(task)

@@ -79,7 +79,6 @@ plugins:
         executable: /absolute/path/to/hcom
         env:
           HCOM_DIR: /absolute/path/to/hcom-state
-          HCOM_AGENT_CATALOGS: /absolute/path/to/hermes-agents.json
         bridges:
           - identity: telegram_agent
             origin:
@@ -94,10 +93,24 @@ selects the existing gateway route where inbound messages are displayed and
 processed. Multiple bridges may be configured, but identities and routes must
 be unique.
 
-`HCOM_AGENT_CATALOGS` adds catalogs visible to this Hermes runtime. Define
-reusable agents there and address them normally with `hcom send @name`; the
-hcom fork can start a stopped catalog agent automatically using its stored
-tool, directory, profile, terminal, and clean/resume policy.
+By default the plugin uses hcom's standard user catalog at
+`~/.hcom/agents.json`. Do not duplicate that catalog in the plugin config.
+
+`HCOM_AGENT_CATALOGS` is an explicit, optional additive catalog. Use it only
+when this Hermes runtime needs agents that must not be visible through the
+standard user catalog:
+
+```yaml
+        env:
+          HCOM_DIR: /absolute/path/to/hcom-state
+          HCOM_AGENT_CATALOGS: /absolute/path/to/hermes-only-agents.json
+```
+
+The extra does not replace the standard user catalog. The bridge validates an
+explicit extra during startup and refuses to start with a clear configuration
+error when the catalog, one of its imports, or a selected agent is stale or
+missing. Reusable agents from valid catalogs can be addressed normally with
+`hcom send @name` and started automatically from their stored launch settings.
 
 ## Delivery contract
 

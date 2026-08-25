@@ -37,6 +37,15 @@ def _config():
     )
 
 
+def _default_catalog_config():
+    config = _config()
+    return plugin.PluginConfig(
+        executable=config.executable,
+        env={"HCOM_DIR": config.env["HCOM_DIR"]},
+        bridges=config.bridges,
+    )
+
+
 def _route_config():
     config = _config()
     return plugin.PluginConfig(
@@ -137,6 +146,9 @@ async def test_shutdown_cancels_listener_before_unregister(tmp_path, monkeypatch
     calls = []
 
     async def run(*args, **_kwargs):
+        if args == ("agent", "list"):
+            calls.append("validate_catalogs")
+            return 0, "", ""
         if args[0] == "start":
             calls.append("start")
             return 0, "", ""
@@ -156,7 +168,71 @@ async def test_shutdown_cancels_listener_before_unregister(tmp_path, monkeypatch
     await listening.wait()
     await service.shutdown()
 
-    assert calls == ["start", "listen", "listen_cancelled", "stop"]
+    assert calls == [
+        "validate_catalogs",
+        "start",
+        "listen",
+        "listen_cancelled",
+        "stop",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_invalid_optional_extra_catalog_fails_before_bridge_start(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: tmp_path)
+    service = plugin.HcomGatewayService(object(), _config())
+    calls = []
+
+    async def run(*args, **_kwargs):
+        calls.append(args)
+        return (
+            1,
+            "",
+            "catalog import /stale/.hcom-agents.json requests unknown agent: wdt_main",
+        )
+
+    service._run = run
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"HCOM_AGENT_CATALOGS configuration is invalid.*unknown agent: wdt_main",
+    ):
+        await service.start()
+
+    assert calls == [("agent", "list")]
+    assert service._tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_default_user_catalog_needs_no_extra_validation(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: tmp_path)
+    service = plugin.HcomGatewayService(object(), _default_catalog_config())
+    calls = []
+
+    async def run(*args, **_kwargs):
+        calls.append(args)
+        if args[0] == "listen":
+            await asyncio.Future()
+        return 0, "", ""
+
+    service._run = run
+    await service.start()
+    await asyncio.sleep(0)
+    await service.shutdown()
+
+    assert ("agent", "list") not in calls
+
+
+def test_extra_catalog_is_only_used_when_explicitly_configured(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HCOM_AGENT_CATALOGS", "/inherited/stale-catalog.json")
+
+    service = plugin.HcomGatewayService(object(), _default_catalog_config())
+
+    assert "HCOM_AGENT_CATALOGS" not in service.child_env
+    assert service.child_env["HCOM_DIR"] == "/tmp/hcom-test"
 
 
 def test_binding_env_is_stable_and_identity_specific(tmp_path, monkeypatch):
