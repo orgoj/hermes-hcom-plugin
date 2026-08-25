@@ -128,3 +128,18 @@ the hcom event ID remains metadata only.
 The configured messaging platform must successfully render the visible inbound
 message before the agent turn is dispatched. This keeps channel visibility and
 agent context consistent instead of silently processing hidden hcom traffic.
+
+## Operational verification
+
+`hcom send` printing `Sent to:` confirms enqueue, not bridge completion. For
+event `N` delivered to identity `X`, end-to-end success requires `X:N` in
+`hcom_completed_events.json` and the bridge identity returning to `listening`.
+The completion ledger is written only after successful platform processing and
+before manual acknowledgement.
+
+For the default Hermes home, verify the completion marker with:
+
+```bash
+jq -e --arg key "X:N" '.completed | index($key) != null' \
+  ~/.hermes/hcom_completed_events.json
+```
