@@ -7,8 +7,10 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_ENV_KEYS = frozenset({"HCOM_DIR", "HCOM_AGENT_CATALOGS"})
 _COMPLETED_LIMIT = 2048
+_ROUTE_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -181,8 +184,137 @@ class CompletedEventStore:
         )
 
 
+class SessionRouteStore:
+    """Durable hcom-thread to exact Hermes-session correlation."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.RLock()
+        self._routes: dict[str, str] = {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("schema_version") != _ROUTE_SCHEMA_VERSION:
+                raise ValueError("unsupported hcom session route schema")
+            routes = data.get("routes") or {}
+            if not isinstance(routes, dict):
+                raise ValueError("hcom session routes must be a mapping")
+            self._routes = {
+                str(key): str(value)
+                for key, value in routes.items()
+                if str(key) and str(value)
+            }
+        except FileNotFoundError:
+            pass
+
+    @staticmethod
+    def _key(identity: str, thread: str) -> str:
+        return f"{identity}\0{thread}"
+
+    def resolve(self, identity: str, thread: str) -> Optional[str]:
+        with self._lock:
+            return self._routes.get(self._key(identity, thread))
+
+    def record(self, identity: str, thread: str, session_key: str) -> None:
+        with self._lock:
+            self._routes[self._key(identity, thread)] = session_key
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json_write(
+                self.path,
+                {
+                    "schema_version": _ROUTE_SCHEMA_VERSION,
+                    "routes": self._routes,
+                },
+                indent=None,
+                mode=0o600,
+            )
+
+
+def _command_route(
+    tool_name: str, args: Any, config: PluginConfig
+) -> Optional[tuple[str, str]]:
+    """Return (identity, thread) for one direct successful hcom send command."""
+    if tool_name != "terminal" or not isinstance(args, dict):
+        return None
+    command = args.get("command")
+    if not isinstance(command, str):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if len(tokens) < 3 or Path(tokens[0]).name != Path(config.executable).name:
+        return None
+    if tokens[1] != "send":
+        return None
+    try:
+        message_separator = tokens.index("--", 2)
+    except ValueError:
+        message_separator = len(tokens)
+    flags = tokens[2:message_separator]
+    if any(token in {";", "&&", "||", "|", "&"} for token in flags):
+        return None
+
+    def flag_value(name: str) -> str:
+        for index, token in enumerate(flags):
+            if token == name and index + 1 < len(flags):
+                return flags[index + 1]
+            prefix = f"{name}="
+            if token.startswith(prefix):
+                return token[len(prefix) :]
+        return ""
+
+    identity = flag_value("--name").strip()
+    thread = flag_value("--thread").strip()
+    if not identity or not thread:
+        return None
+    return identity, thread
+
+
+def _record_hcom_session_route(
+    route_store: SessionRouteStore,
+    *,
+    tool_name: str = "",
+    args: Any = None,
+    result: Any = None,
+    status: str = "",
+    **_: Any,
+) -> None:
+    """Capture a route only after hcom confirms a successful outbound send."""
+    if status != "ok":
+        return
+    config = PluginConfig.load()
+    route = _command_route(tool_name, args, config)
+    if route is None:
+        return
+    identity, thread = route
+    binding = next(
+        (candidate for candidate in config.bridges if candidate.identity == identity),
+        None,
+    )
+    if binding is None:
+        return
+
+    from gateway.session_context import get_session_env
+
+    session_key = get_session_env("HERMES_SESSION_KEY", "").strip()
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip()
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    if not session_key:
+        return
+    if platform != str(binding.origin.get("platform") or ""):
+        return
+    if chat_id != str(binding.origin.get("chat_id") or ""):
+        return
+    route_store.record(identity, thread, session_key)
+
+
 class HcomGatewayService:
-    def __init__(self, runner: Any, config: PluginConfig):
+    def __init__(
+        self,
+        runner: Any,
+        config: PluginConfig,
+        routes: Optional[SessionRouteStore] = None,
+    ):
         self.runner = runner
         self.config = config
         self.child_env = os.environ.copy()
@@ -191,6 +323,9 @@ class HcomGatewayService:
         self.child_env.update(config.env)
         self.completed = CompletedEventStore(
             Path(get_hermes_home()) / "hcom_completed_events.json"
+        )
+        self.routes = routes or SessionRouteStore(
+            Path(get_hermes_home()) / "hcom_session_routes.json"
         )
         self._tasks: set[asyncio.Task[Any]] = set()
         self._registered: set[str] = set()
@@ -288,14 +423,24 @@ class HcomGatewayService:
             await self._ack(binding.identity, envelope.event_id)
             return
         from gateway.platforms.base import ProcessingOutcome
-        from gateway.session import SessionSource
+        dispatch_route: dict[str, Any]
+        if envelope.thread:
+            session_key = self.routes.resolve(binding.identity, envelope.thread)
+            if not session_key:
+                raise RuntimeError(
+                    f"hcom thread {envelope.thread!r} has no correlated Hermes session"
+                )
+            dispatch_route = {"session_key": session_key}
+        else:
+            from gateway.session import SessionSource
+
+            dispatch_route = {"source": SessionSource.from_dict(binding.origin)}
 
         outcome = await self.runner.dispatch_internal_message(
-            source=SessionSource.from_dict(binding.origin),
+            **dispatch_route,
             text=envelope.event_text(binding.identity),
             user_id=envelope.sender,
             user_name=envelope.sender,
-            message_id=str(envelope.event_id),
             metadata={
                 "hcom": {
                     "identity": binding.identity,
@@ -398,8 +543,12 @@ def _notify_cli(*args: str) -> None:
 
 
 def register(ctx) -> None:
+    route_store = SessionRouteStore(
+        Path(get_hermes_home()) / "hcom_session_routes.json"
+    )
     ctx.register_gateway_service(
-        "hcom", lambda runner: HcomGatewayService(runner, PluginConfig.load())
+        "hcom",
+        lambda runner: HcomGatewayService(runner, PluginConfig.load(), route_store),
     )
     def hcom_prompt(*, source, **_) -> str:
         config = PluginConfig.load()
@@ -418,6 +567,10 @@ def register(ctx) -> None:
         return ""
 
     ctx.register_gateway_prompt_provider("hcom", hcom_prompt)
+    ctx.register_hook(
+        "post_tool_call",
+        lambda **payload: _record_hcom_session_route(route_store, **payload),
+    )
     ctx.register_hook("on_cli_ready", lambda **_: _notify_cli("hermes-start"))
     ctx.register_hook(
         "on_cli_turn_start", lambda **_: _notify_cli("hermes-status", "active")

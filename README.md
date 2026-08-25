@@ -19,6 +19,9 @@ For every configured bridge, the plugin:
   identity and instructing it to use the hcom skill for communication;
 - propagates the identity to terminal subprocesses without changing the
   process-global environment;
+- correlates each successful outbound `hcom send --thread ...` with the exact
+  Hermes gateway session that sent it, preserving Telegram topics and other
+  threaded routes across gateway restarts;
 - acknowledges an hcom event only after Hermes has processed it, with a
   durable completion ledger for restart-safe at-least-once delivery;
 - reports interactive `hcom hermes` readiness, active-turn, listening, and
@@ -102,6 +105,12 @@ Gateway delivery is at least once. The plugin uses manual acknowledgement and
 records completed event IDs before acknowledging them to hcom. If the gateway
 stops before completion, hcom may redeliver the event after restart; a recorded
 completion prevents duplicate processing.
+
+Threaded hcom replies are routed through a durable mapping from hcom thread to
+the exact Hermes session key. A threaded event without a known mapping is left
+unacknowledged and retried; it is never allowed to fall back into the configured
+root chat. The visible inbound platform message supplies the reply anchor, while
+the hcom event ID remains metadata only.
 
 The configured messaging platform must successfully render the visible inbound
 message before the agent turn is dispatched. This keeps channel visibility and
