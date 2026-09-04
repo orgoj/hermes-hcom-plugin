@@ -1,0 +1,13 @@
+# Dippy config for hermes-hcom-plugin
+
+# Venv activation
+allow source ~/projects/hermes-agent/.venv/bin/activate
+allow source ~/projects/hermes-agent/venv/bin/activate
+allow . ~/projects/hermes-agent/.venv/bin/activate
+allow . ~/projects/hermes-agent/venv/bin/activate
+
+# Testing & linting
+allow pytest
+allow pytest *
+allow ruff check
+allow ruff check *
