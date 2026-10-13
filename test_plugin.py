@@ -118,6 +118,7 @@ def test_prompt_declares_authoritative_registered_identity(monkeypatch):
     assert "identity is kato" in prompt
     assert "hcom skill" in prompt
     assert "--name kato" in prompt
+    assert "--thread" in prompt
     assert "Never run hcom start" in prompt
 
 
@@ -334,24 +335,67 @@ def test_successful_hcom_send_records_exact_session_route(tmp_path, monkeypatch)
     )
 
 
-def test_hcom_route_capture_rejects_chained_or_unscoped_commands():
-    config = _route_config()
+def _record_from_topic(routes, command):
+    from gateway.session_context import clear_session_vars, set_session_vars
 
-    assert plugin._command_route(
-        "terminal",
-        {
-            "command": (
-                "hcom send @nova --thread topic --name kato && "
-                "hcom send @nova --thread other --name kato"
-            )
-        },
-        config,
-    ) is None
-    assert plugin._command_route(
-        "terminal",
-        {"command": "hcom send @nova --thread topic -- hello"},
-        config,
-    ) is None
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="123",
+        thread_id="30785",
+        session_key="agent:main:telegram:dm:123:30785",
+    )
+    try:
+        plugin._record_hcom_session_route(
+            routes,
+            tool_name="terminal",
+            args={"command": command},
+            status="ok",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "hcom --name kato send @nova --intent request --thread topic -- 'hi'",
+        "hcom --name=kato send @nova --thread=topic -- 'hi'",
+        "/usr/bin/hcom send @nova --thread topic -- 'hi'",
+        "cd /srv && hcom send @nova --thread topic --name kato -- 'a; b && c'",
+    ],
+)
+def test_every_hcom_send_form_records_the_sending_session(
+    tmp_path, monkeypatch, command
+):
+    monkeypatch.setattr(
+        plugin.PluginConfig, "load", classmethod(lambda cls: _route_config())
+    )
+    routes = plugin.SessionRouteStore(tmp_path / "routes.json")
+
+    _record_from_topic(routes, command)
+
+    assert routes.resolve("kato", "topic") == "agent:main:telegram:dm:123:30785"
+
+
+def test_chained_sends_record_each_thread_and_skip_foreign_identity(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        plugin.PluginConfig, "load", classmethod(lambda cls: _route_config())
+    )
+    routes = plugin.SessionRouteStore(tmp_path / "routes.json")
+
+    _record_from_topic(
+        routes,
+        "hcom send @nova --thread alpha --name kato -- 'x'\n"
+        "hcom --name kato send @nova --thread beta -- 'y'; "
+        "hcom send @nova --thread gamma --name luna -- 'z'",
+    )
+
+    assert routes.resolve("kato", "alpha") == "agent:main:telegram:dm:123:30785"
+    assert routes.resolve("kato", "beta") == "agent:main:telegram:dm:123:30785"
+    assert routes.resolve("kato", "gamma") is None
+    assert routes.resolve("luna", "gamma") is None
 
 
 @pytest.mark.asyncio
@@ -401,17 +445,23 @@ async def test_two_hcom_threads_dispatch_to_two_exact_sessions(
 
 
 @pytest.mark.asyncio
-async def test_unknown_hcom_thread_stays_unacked(tmp_path, monkeypatch):
+async def test_unknown_hcom_thread_goes_to_root_chat_and_unblocks_queue(
+    tmp_path, monkeypatch
+):
+    from gateway.platforms.base import ProcessingOutcome
+
     monkeypatch.setattr(plugin, "get_hermes_home", lambda: tmp_path)
+    calls = []
 
     class Runner:
-        async def dispatch_internal_message(self, **_kwargs):
-            raise AssertionError("unknown thread must not dispatch")
+        async def dispatch_internal_message(self, **kwargs):
+            calls.append(("dispatch", kwargs))
+            return ProcessingOutcome.SUCCESS
 
     service = plugin.HcomGatewayService(Runner(), _config())
 
-    async def ack(*_args):
-        raise AssertionError("unknown thread must not ack")
+    async def ack(identity, event_id):
+        calls.append(("ack", identity, event_id))
 
     service._ack = ack
     envelope = plugin.HcomEnvelope.from_json(
@@ -425,7 +475,10 @@ async def test_unknown_hcom_thread_stays_unacked(tmp_path, monkeypatch):
             }
         )
     )
-    with pytest.raises(RuntimeError, match="no correlated Hermes session"):
-        await service._process(_config().bridges[0], envelope)
+    await service._process(_config().bridges[0], envelope)
 
-    assert not service.completed.contains("kato", 13)
+    dispatch = calls[0][1]
+    assert dispatch["source"].chat_id == "123"
+    assert "session_key" not in dispatch
+    assert calls[1] == ("ack", "kato", 13)
+    assert service.completed.contains("kato", 13)

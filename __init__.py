@@ -229,45 +229,74 @@ class SessionRouteStore:
             )
 
 
-def _command_route(
-    tool_name: str, args: Any, config: PluginConfig
-) -> Optional[tuple[str, str]]:
-    """Return (identity, thread) for one direct successful hcom send command."""
-    if tool_name != "terminal" or not isinstance(args, dict):
+_SHELL_OPERATORS = frozenset({";", "&&", "||", "|", "&", "(", ")"})
+
+
+def _flag_value(flags: list[str], name: str) -> str:
+    for index, token in enumerate(flags):
+        if token == name and index + 1 < len(flags):
+            return flags[index + 1].strip()
+        if token.startswith(f"{name}="):
+            return token[len(name) + 1 :].strip()
+    return ""
+
+
+def _send_route(argv: list[str]) -> Optional[tuple[str, str]]:
+    """Return (identity, thread) for one `hcom [--name X] send ...` argv tail."""
+    index = 0
+    while index < len(argv) and argv[index] != "send":
+        if argv[index] == "--name":
+            index += 2
+        elif argv[index].startswith("--name="):
+            index += 1
+        else:
+            return None
+    if index >= len(argv):
         return None
+    try:
+        message_separator = argv.index("--", index)
+    except ValueError:
+        message_separator = len(argv)
+    flags = argv[:index] + argv[index + 1 : message_separator]
+    thread = _flag_value(flags, "--thread")
+    if not thread:
+        return None
+    return _flag_value(flags, "--name"), thread
+
+
+def _command_routes(
+    tool_name: str, args: Any, config: PluginConfig
+) -> list[tuple[str, str]]:
+    """Return (identity, thread) for every threaded hcom send in a terminal command.
+
+    The identity is empty when the command relies on the bound identity
+    instead of an explicit `--name`.
+    """
+    if tool_name != "terminal" or not isinstance(args, dict):
+        return []
     command = args.get("command")
     if not isinstance(command, str):
-        return None
+        return []
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
     try:
-        tokens = shlex.split(command, posix=True)
+        tokens = list(lexer)
     except ValueError:
-        return None
-    if len(tokens) < 3 or Path(tokens[0]).name != Path(config.executable).name:
-        return None
-    if tokens[1] != "send":
-        return None
-    try:
-        message_separator = tokens.index("--", 2)
-    except ValueError:
-        message_separator = len(tokens)
-    flags = tokens[2:message_separator]
-    if any(token in {";", "&&", "||", "|", "&"} for token in flags):
-        return None
-
-    def flag_value(name: str) -> str:
-        for index, token in enumerate(flags):
-            if token == name and index + 1 < len(flags):
-                return flags[index + 1]
-            prefix = f"{name}="
-            if token.startswith(prefix):
-                return token[len(prefix) :]
-        return ""
-
-    identity = flag_value("--name").strip()
-    thread = flag_value("--thread").strip()
-    if not identity or not thread:
-        return None
-    return identity, thread
+        return []
+    executable = Path(config.executable).name
+    starts = [i for i, token in enumerate(tokens) if Path(token).name == executable]
+    routes = []
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(tokens)
+        argv = tokens[start + 1 : end]
+        for offset, token in enumerate(argv):
+            if token in _SHELL_OPERATORS:
+                argv = argv[:offset]
+                break
+        route = _send_route(argv)
+        if route is not None:
+            routes.append(route)
+    return routes
 
 
 def _record_hcom_session_route(
@@ -283,15 +312,8 @@ def _record_hcom_session_route(
     if status != "ok":
         return
     config = PluginConfig.load()
-    route = _command_route(tool_name, args, config)
-    if route is None:
-        return
-    identity, thread = route
-    binding = next(
-        (candidate for candidate in config.bridges if candidate.identity == identity),
-        None,
-    )
-    if binding is None:
+    routes = _command_routes(tool_name, args, config)
+    if not routes:
         return
 
     from gateway.session_context import get_session_env
@@ -301,11 +323,20 @@ def _record_hcom_session_route(
     chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
     if not session_key:
         return
-    if platform != str(binding.origin.get("platform") or ""):
+    binding = next(
+        (
+            candidate
+            for candidate in config.bridges
+            if platform == str(candidate.origin.get("platform") or "")
+            and chat_id == str(candidate.origin.get("chat_id") or "")
+        ),
+        None,
+    )
+    if binding is None:
         return
-    if chat_id != str(binding.origin.get("chat_id") or ""):
-        return
-    route_store.record(identity, thread, session_key)
+    for identity, thread in routes:
+        if identity in ("", binding.identity):
+            route_store.record(binding.identity, thread, session_key)
 
 
 class HcomGatewayService:
@@ -441,15 +472,17 @@ class HcomGatewayService:
             await self._ack(binding.identity, envelope.event_id)
             return
         from gateway.platforms.base import ProcessingOutcome
+        session_key = (
+            self.routes.resolve(binding.identity, envelope.thread)
+            if envelope.thread
+            else None
+        )
         dispatch_route: dict[str, Any]
-        if envelope.thread:
-            session_key = self.routes.resolve(binding.identity, envelope.thread)
-            if not session_key:
-                raise RuntimeError(
-                    f"hcom thread {envelope.thread!r} has no correlated Hermes session"
-                )
+        if session_key:
             dispatch_route = {"session_key": session_key}
         else:
+            # A thread this identity never sent on is a conversation another agent
+            # started; leaving it unacked would block every later event forever.
             from gateway.session import SessionSource
 
             dispatch_route = {"source": SessionSource.from_dict(binding.origin)}
@@ -580,8 +613,11 @@ def register(ctx) -> None:
                 return (
                     "hcom is active for this session. Your registered hcom identity is "
                     f"{binding.identity}. Use the hcom skill whenever communicating over "
-                    f"hcom and pass --name {binding.identity} on every hcom command. Never "
-                    "run hcom start: the gateway plugin owns registration and lifecycle."
+                    f"hcom and pass --name {binding.identity} on every hcom command. Pass "
+                    "--thread <topic> on every hcom send that expects a reply: replies on "
+                    "that thread return to this session, unthreaded ones to the root chat. "
+                    "Never run hcom start: the gateway plugin owns registration and "
+                    "lifecycle."
                 )
         return ""
 

@@ -120,10 +120,14 @@ stops before completion, hcom may redeliver the event after restart; a recorded
 completion prevents duplicate processing.
 
 Threaded hcom replies are routed through a durable mapping from hcom thread to
-the exact Hermes session key. A threaded event without a known mapping is left
-unacknowledged and retried; it is never allowed to fall back into the configured
-root chat. The visible inbound platform message supplies the reply anchor, while
-the hcom event ID remains metadata only.
+the exact Hermes session key. Every threaded `hcom send` in a successful
+terminal command records the mapping, whether `--name` comes before or after
+`send`, is omitted, or the send is part of a command chain. A threaded event
+without a known mapping is a conversation another agent started, so it goes to
+the configured root chat like an unthreaded event; leaving it unacknowledged
+would block every later event. The agent is told to pass `--thread` on sends
+that expect a reply. The visible inbound platform message supplies the reply
+anchor, while the hcom event ID remains metadata only.
 
 The configured messaging platform must successfully render the visible inbound
 message before the agent turn is dispatched. This keeps channel visibility and
